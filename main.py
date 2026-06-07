@@ -2,10 +2,20 @@ import os
 import json
 import re
 import logging
-from typing import Dict, Optional, Set
+import time
+import pandas as pd
+import numpy as np
+
+from typing import Dict, Set, final
 from tqdm import tqdm
+from dotenv import load_dotenv
+from google import genai
 
 from src.scraper import Scraper
+from src.generator import ArticleGenerator
+from src.batch_generator import AIBatchGenerator
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 
 MAX_URLS = 5000
 DATASETS = {
@@ -37,7 +47,6 @@ DATASETS = {
 }
 
 logger = logging.getLogger(__name__)
-
 
 def get_dataset_config(dataset_type: str) -> Dict:
     if dataset_type not in DATASETS:
@@ -104,17 +113,97 @@ def build_dataset(dataset_type: str, scraper: Scraper) -> None:
     save_dataset(dataset, dataset_type)
 
 
+def extract_tfidf_topics(texts, top_k=1):
+    vectorizer = TfidfVectorizer(
+        max_features=5000,
+        stop_words=None  # Polish stopwords optional (see below)
+    )
+
+    X = vectorizer.fit_transform(texts)
+    terms = np.array(vectorizer.get_feature_names_out())
+
+    topics = []
+
+    for i in range(X.shape[0]):
+        row = X[i].toarray().flatten()
+        top_indices = row.argsort()[-top_k:][::-1]
+        topics.append(" ".join(terms[top_indices]))
+
+    return topics
+
+
+def load_jsonl(path):
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            rows.append(json.loads(line))
+    return pd.DataFrame(rows)
+
+
 def main(force: bool = False):
-    logging.basicConfig(level=logging.INFO)
     scraper = Scraper()
 
     for dataset_type in DATASETS:
         output_file = f"{dataset_type}_dataset.jsonl"
-        if not os.path.exists(output_file) or force==True:
+        if not os.path.exists(f"dataset/{output_file}") or force==True:
             build_dataset(dataset_type, scraper)
         else:
             logger.info(f"Skipping {dataset_type}, {output_file} already exists")
+    
+    
+    human_dfs = []
+
+    for dataset_type in DATASETS:
+        path = f"dataset/{dataset_type}_dataset.jsonl"
+        df = load_jsonl(path)
+        df["source_type"] = "human"
+        human_dfs.append(df)
+
+    human = pd.concat(human_dfs, ignore_index=True)
+    human = human.dropna(subset=["text"])
+    human = human[human["text"].str.len() > 400]
+    
+    load_dotenv()
+    
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    MODEL = "gemini-2.5-flash"  # fast + cheap + good enough for datasets
+    generator = ArticleGenerator(client, MODEL)
+    
+    topics = extract_tfidf_topics(human["text"].tolist(), top_k=2)
+    
+    ai_runner = AIBatchGenerator(
+        generator=generator,
+        batch_size=10,
+        sleep_time=60,
+        output_path="dataset/final_dataset.jsonl"
+    )
+
+    ai_rows = ai_runner.generate(topics)
+    ai_df = pd.DataFrame(ai_rows)
+    ai_df["source_type"] = "ai"
+    
+    min_size = min(len(human), len(ai_df))
+
+    final = pd.concat([
+        human.sample(min_size, random_state=42),
+        ai_df.sample(min_size, random_state=42)
+    ])
+
+    final = final.sample(frac=1, random_state=42)
+    
+    os.makedirs("dataset", exist_ok=True)
+
+    final.to_json(
+        "dataset/final_dataset.jsonl",
+        orient="records",
+        lines=True,
+        force_ascii=False
+    )
+
+    logger.info(f"Final dataset size: {len(final)}")
+    
 
 
 if __name__ == "__main__":
-    main(force=True)
+    logging.basicConfig(level=logging.INFO)
+    main(force=False)
